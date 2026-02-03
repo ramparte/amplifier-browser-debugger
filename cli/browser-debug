@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+browser-debug - Universal web debugging CLI
+Token-efficient browser debugging via agent-browser + injected inspectors
+"""
+import subprocess
+import json
+import sys
+from pathlib import Path
+import argparse
+
+class BrowserDebugCLI:
+    def __init__(self):
+        self.root_dir = Path(__file__).parent.parent
+        self.core_dir = self.root_dir / 'core'
+        self.inspectors_dir = self.root_dir / 'inspectors'
+        
+        # Map logical names to file names
+        self.inspector_files = {
+            'dom': 'dom-inspector.js',
+            'events': 'event-inspector.js',
+            'network': 'network-inspector.js',
+            'framework': 'framework-inspector.js'
+        }
+        
+    def inject_core(self):
+        """Inject core framework"""
+        files = [
+            self.core_dir / 'inspector-base.js',
+            self.core_dir / 'injector.js'
+        ]
+        
+        for file in files:
+            if not file.exists():
+                print(f"Error: {file} not found", file=sys.stderr)
+                return False
+            
+            with open(file) as f:
+                js = f.read()
+            
+            result = subprocess.run(
+                ['agent-browser', 'eval', js],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                print(f"Error injecting {file.name}: {result.stderr}", file=sys.stderr)
+                return False
+        
+        return True
+    
+    def inject_inspector(self, inspector_name):
+        """Inject a specific inspector"""
+        filename = self.inspector_files.get(inspector_name)
+        if not filename:
+            print(f"Error: Unknown inspector '{inspector_name}'", file=sys.stderr)
+            return False
+            
+        file = self.inspectors_dir / filename
+        
+        if not file.exists():
+            print(f"Error: Inspector file not found: {file}", file=sys.stderr)
+            return False
+        
+        with open(file) as f:
+            js = f.read()
+        
+        result = subprocess.run(
+            ['agent-browser', 'eval', js],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"Error injecting {inspector_name}: {result.stderr}", file=sys.stderr)
+            return False
+        
+        return True
+    
+    def initialize_debugger(self, inspectors):
+        """Initialize BrowserDebugger with specified inspectors"""
+        js = f"""
+        window.__browserDebugger = new BrowserDebugger([]);
+        
+        // Register inspectors
+        if (typeof DOMInspector !== 'undefined') {{
+            window.__browserDebugger.registerInspector('dom', DOMInspector);
+        }}
+        if (typeof EventInspector !== 'undefined') {{
+            window.__browserDebugger.registerInspector('events', EventInspector);
+        }}
+        if (typeof NetworkInspector !== 'undefined') {{
+            window.__browserDebugger.registerInspector('network', NetworkInspector);
+        }}
+        if (typeof FrameworkInspector !== 'undefined') {{
+            window.__browserDebugger.registerInspector('framework', FrameworkInspector);
+        }}
+        
+        // Enable requested inspectors
+        {json.dumps(inspectors)}.forEach(name => {{
+            window.__browserDebugger.enable(name);
+        }});
+        
+        'BrowserDebugger initialized with: ' + {json.dumps(inspectors)}.join(', ');
+        """
+        
+        result = subprocess.run(
+            ['agent-browser', 'eval', js],
+            capture_output=True,
+            text=True
+        )
+        
+        return result.returncode == 0
+    
+    def inject(self, inspectors=None):
+        """Inject core + inspectors"""
+        if inspectors is None:
+            inspectors = ['dom', 'events', 'network', 'framework']
+        
+        # Inject core framework
+        print("Injecting core framework...")
+        if not self.inject_core():
+            return False
+        
+        # Inject inspectors
+        print(f"Injecting inspectors: {', '.join(inspectors)}...")
+        for inspector in inspectors:
+            if not self.inject_inspector(inspector):
+                return False
+        
+        # Initialize debugger
+        print("Initializing BrowserDebugger...")
+        if not self.initialize_debugger(inspectors):
+            return False
+        
+        print(f"✓ Successfully injected: {', '.join(inspectors)}")
+        return True
+    
+    def capture(self, inspectors=None, label=None):
+        """Capture state from inspectors"""
+        inspectors_arg = json.dumps(inspectors) if inspectors else 'null'
+        
+        js = f"JSON.stringify(window.__browserDebugger.capture({inspectors_arg}))"
+        
+        result = subprocess.run(
+            ['agent-browser', 'eval', js, '--json'],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"Error capturing state: {result.stderr}", file=sys.stderr)
+            return None
+        
+        try:
+            data = json.loads(result.stdout)
+            state = json.loads(data['data']['result'])
+            
+            if label:
+                state['label'] = label
+            
+            return state
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error parsing capture result: {e}", file=sys.stderr)
+            return None
+    
+    def enable_inspector(self, inspector):
+        """Enable a specific inspector"""
+        js = f'window.__browserDebugger.enable("{inspector}")'
+        result = subprocess.run(['agent-browser', 'eval', js])
+        return result.returncode == 0
+    
+    def disable_inspector(self, inspector):
+        """Disable a specific inspector"""
+        js = f'window.__browserDebugger.disable("{inspector}")'
+        result = subprocess.run(['agent-browser', 'eval', js])
+        return result.returncode == 0
+    
+    def list_inspectors(self):
+        """List available inspectors"""
+        js = 'JSON.stringify(window.__browserDebugger.listInspectors())'
+        result = subprocess.run(
+            ['agent-browser', 'eval', js, '--json'],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                inspectors = json.loads(data['data']['result'])
+                return inspectors
+            except:
+                pass
+        
+        return []
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='browser-debug - Universal web UI debugging toolkit',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Inject all inspectors
+  browser-debug inject
+  
+  # Inject specific inspectors
+  browser-debug inject --inspectors dom,events
+  
+  # Capture state
+  browser-debug capture --label before_action > before.json
+  
+  # Capture specific inspectors
+  browser-debug capture --inspectors dom,events > state.json
+  
+  # Enable/disable inspectors
+  browser-debug enable events
+  browser-debug disable network
+  
+  # List inspectors
+  browser-debug list
+
+Available inspectors:
+  dom        - DOM structure and mutations
+  events     - Event tracing (keyboard, mouse, etc.)
+  network    - Network requests/responses
+  framework  - Framework state (React/Vue/Word3/etc.)
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Inject command
+    inject_parser = subparsers.add_parser('inject', help='Inject debugger into page')
+    inject_parser.add_argument(
+        '--inspectors',
+        help='Comma-separated list of inspectors to inject (default: all)',
+        default=None
+    )
+    
+    # Capture command
+    capture_parser = subparsers.add_parser('capture', help='Capture current state')
+    capture_parser.add_argument(
+        '--inspectors',
+        help='Comma-separated list of inspectors to capture from',
+        default=None
+    )
+    capture_parser.add_argument(
+        '--label',
+        help='Label for this capture',
+        default=None
+    )
+    
+    # Enable command
+    enable_parser = subparsers.add_parser('enable', help='Enable an inspector')
+    enable_parser.add_argument('inspector', help='Inspector to enable')
+    
+    # Disable command
+    disable_parser = subparsers.add_parser('disable', help='Disable an inspector')
+    disable_parser.add_argument('inspector', help='Inspector to disable')
+    
+    # List command
+    subparsers.add_parser('list', help='List all inspectors')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    cli = BrowserDebugCLI()
+    
+    if args.command == 'inject':
+        inspectors = args.inspectors.split(',') if args.inspectors else None
+        success = cli.inject(inspectors)
+        return 0 if success else 1
+    
+    elif args.command == 'capture':
+        inspectors = args.inspectors.split(',') if args.inspectors else None
+        state = cli.capture(inspectors, args.label)
+        if state:
+            print(json.dumps(state, indent=2))
+            return 0
+        return 1
+    
+    elif args.command == 'enable':
+        success = cli.enable_inspector(args.inspector)
+        if success:
+            print(f"✓ Enabled: {args.inspector}")
+            return 0
+        return 1
+    
+    elif args.command == 'disable':
+        success = cli.disable_inspector(args.inspector)
+        if success:
+            print(f"✓ Disabled: {args.inspector}")
+            return 0
+        return 1
+    
+    elif args.command == 'list':
+        inspectors = cli.list_inspectors()
+        if inspectors:
+            print("Available inspectors:")
+            for inspector in inspectors:
+                status = "✓ enabled" if inspector['enabled'] else "○ disabled"
+                print(f"  {inspector['name']:<12} {status}")
+            return 0
+        else:
+            print("No inspectors found (debugger not injected?)")
+            return 1
+    
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
